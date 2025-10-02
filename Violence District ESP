@@ -1,0 +1,558 @@
+-- LocalScript (put in StarterPlayerScripts)
+-- Improved ESP - robust against respawns, camera/map reloads
+--!nonstrict
+--!optimize 2
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Keep camera reference fresh across resets
+local Camera = Workspace.CurrentCamera
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    Camera = Workspace.CurrentCamera
+end)
+
+-- Stable container for highlights so they persist through character/map churn
+local HighlightFolder = CoreGui:FindFirstChild("ESP_Highlights") or Instance.new("Folder")
+HighlightFolder.Name = "ESP_Highlights"
+HighlightFolder.Parent = CoreGui
+
+--[[--------------------------------------------------------------------------------
+    [CONFIG]
+----------------------------------------------------------------------------------]]
+local Config = {
+    MaxDistance = 300,
+    TextSize = { Min = 8, Max = 22 },
+    MenuKeybind = Enum.KeyCode.RightControl,
+    Toggles = {
+        Players = false,
+        Generators = false,
+        Pallets = false,
+        Hooks = false,
+    },
+    ObjectTypes = {
+        Players = {
+            GetColor = function(character)
+                local isKiller = character and character:FindFirstChild("Killerost")
+                if isKiller then
+                    return Color3.fromRGB(255, 40, 40), Color3.fromRGB(100, 0, 0)
+                else
+                    return Color3.fromRGB(0, 255, 127), Color3.fromRGB(0, 100, 50)
+                end
+            end,
+            GetText = function(player, distance)
+                return player.Name .. " [" .. math.floor(distance) .. "m]"
+            end
+        },
+        Generators = {
+            TargetName = "generator",
+            LabelText = "Generator",
+            ToggleKey = "Generators",
+            TextColor = Color3.fromRGB(0, 200, 255),
+            OutlineColor = Color3.fromRGB(0, 200, 255),
+            FillColor = Color3.fromRGB(0, 100, 150)
+        },
+        Pallets = {
+            TargetName = "palletwrong",
+            LabelText = "Pallet",
+            ToggleKey = "Pallets",
+            TextColor = Color3.fromRGB(255, 255, 0),
+            OutlineColor = Color3.fromRGB(255, 255, 0),
+            FillColor = Color3.fromRGB(100, 100, 0)
+        },
+        Hooks = {
+            TargetName = "hook",
+            LabelText = "Hook",
+            ToggleKey = "Hooks",
+            TextColor = Color3.fromRGB(200, 0, 255),
+            OutlineColor = Color3.fromRGB(200, 0, 255),
+            FillColor = Color3.fromRGB(100, 0, 100)
+        }
+    }
+}
+
+--[[--------------------------------------------------------------------------------
+    [UTILS]
+----------------------------------------------------------------------------------]]
+local function safeFindBillboardPart(character: Model?)
+    if not character or not character.Parent then return nil end
+    -- Prefer Head for label readability, fallback to HRP or any BasePart
+    local head = character:FindFirstChild("Head")
+    if head and head:IsA("BasePart") then return head end
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if hrp and hrp:IsA("BasePart") then return hrp end
+    return character:FindFirstChildWhichIsA("BasePart")
+end
+
+local function createBillboard(part: BasePart)
+    local board = Instance.new("BillboardGui")
+    board.Name = "ESP_Billboard"
+    board.Size = UDim2.fromOffset(200, 40)
+    board.StudsOffset = Vector3.new(0, 3, 0)
+    board.AlwaysOnTop = true
+    board.ResetOnSpawn = false
+    board.Enabled = false
+    board.Parent = part
+
+    local label = Instance.new("TextLabel")
+    label.Name = "ESP_Label"
+    label.Size = UDim2.fromScale(1, 1)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.SourceSansBold
+    label.TextScaled = false
+    label.TextStrokeTransparency = 0.6
+    label.TextColor3 = Color3.new(1, 1, 1)
+    label.Text = ""
+    label.Parent = board
+
+    return board, label
+end
+
+local function createHighlight(adornee: Instance)
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "ESP_Highlight"
+    highlight.Adornee = adornee
+    highlight.FillTransparency = 0.7
+    highlight.OutlineTransparency = 0
+    highlight.Enabled = false
+    -- Parent to a stable container, not the target (so it survives target respawns)
+    highlight.Parent = HighlightFolder
+    return highlight
+end
+
+-- Track all ESP entries; each entry gets its own connection bucket
+local ESPEntries: { [any]: { conns: { RBXScriptConnection }, [string]: any } } = {}
+
+local function disconnectAll(entry)
+    if not entry or not entry.conns then return end
+    for _, c in ipairs(entry.conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    entry.conns = {}
+end
+
+local function removeEntry(key)
+    local entry = ESPEntries[key]
+    if not entry then return end
+    disconnectAll(entry)
+    if entry.billboard then entry.billboard:Destroy() end
+    if entry.highlight then entry.highlight:Destroy() end
+    ESPEntries[key] = nil
+end
+
+--[[--------------------------------------------------------------------------------
+    [CORE UPDATE]
+----------------------------------------------------------------------------------]]
+local function updateVisuals(entry, cameraPosition: Vector3?)
+    -- Early outs
+    if not cameraPosition or not Config.Toggles[entry.toggleKey] then
+        if entry.billboard and entry.billboard.Enabled then entry.billboard.Enabled = false end
+        if entry.highlight and entry.highlight.Enabled then entry.highlight.Enabled = false end
+        return
+    end
+
+    local targetPart: BasePart?
+    if entry.type == "player" then
+        -- Try to keep the billboard attached to a valid part even if Head changes
+        targetPart = safeFindBillboardPart(entry.character)
+        -- If part changed, rebuild billboard on the new part
+        if targetPart and (not entry.billboard or entry.billboard.Adornee ~= targetPart) then
+            if entry.billboard then entry.billboard:Destroy() end
+            local board, label = createBillboard(targetPart)
+            entry.billboard, entry.label = board, label
+        end
+    elseif entry.type == "map" then
+        -- Re-check primary part each tick in case it changes during reloads
+        local pp = (entry.model and entry.model.PrimaryPart) or (entry.model and entry.model:FindFirstChildWhichIsA("BasePart"))
+        entry.primaryPart = pp
+        targetPart = pp
+        if targetPart and (not entry.billboard or entry.billboard.Adornee ~= targetPart) then
+            if entry.billboard then entry.billboard:Destroy() end
+            local board, label = createBillboard(targetPart)
+            entry.billboard, entry.label = board, label
+        end
+    end
+
+    if not targetPart then
+        if entry.billboard and entry.billboard.Enabled then entry.billboard.Enabled = false end
+        if entry.highlight and entry.highlight.Enabled then entry.highlight.Enabled = false end
+        return
+    end
+
+    -- Ensure visuals are enabled
+    if entry.billboard and not entry.billboard.Enabled then entry.billboard.Enabled = true end
+    if entry.highlight and not entry.highlight.Enabled then entry.highlight.Enabled = true end
+
+    local distance = (cameraPosition - targetPart.Position).Magnitude
+    if entry.label then
+        entry.label.TextSize = math.clamp(
+            Config.TextSize.Max - (distance / Config.MaxDistance) * (Config.TextSize.Max - Config.TextSize.Min),
+            Config.TextSize.Min,
+            Config.TextSize.Max
+        )
+    end
+
+    if entry.type == "player" then
+        if entry.label then
+            entry.label.Text = Config.ObjectTypes.Players.GetText(entry.player, distance)
+        end
+        local outlineColor, fillColor = Config.ObjectTypes.Players.GetColor(entry.character)
+        if outlineColor and fillColor and entry.highlight then
+            entry.highlight.OutlineColor = outlineColor
+            entry.highlight.FillColor = fillColor
+        end
+        if entry.label then
+            entry.label.TextColor3 = outlineColor or Color3.new(1, 1, 1)
+        end
+    else -- map
+        if entry.label then
+            entry.label.Text = string.format("%s [%dm]", entry.labelText, math.floor(distance))
+            entry.label.TextColor3 = entry.textColor
+        end
+        if entry.highlight then
+            entry.highlight.OutlineColor = entry.outlineColor
+            entry.highlight.FillColor = entry.fillColor
+        end
+    end
+end
+
+--[[--------------------------------------------------------------------------------
+    [REGISTRATION]
+----------------------------------------------------------------------------------]]
+local function registerMapObject(model: Model, objectConfig)
+    if ESPEntries[model] then return end
+    local primaryPart = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+    if not primaryPart then return end
+
+    local highlight = createHighlight(model)
+    local board, label = createBillboard(primaryPart)
+
+    ESPEntries[model] = {
+        key = model,
+        type = "map",
+        toggleKey = objectConfig.ToggleKey,
+        model = model,
+        primaryPart = primaryPart,
+        billboard = board,
+        label = label,
+        highlight = highlight,
+        labelText = objectConfig.LabelText,
+        textColor = objectConfig.TextColor,
+        outlineColor = objectConfig.OutlineColor,
+        fillColor = objectConfig.FillColor,
+        conns = {},
+    }
+
+    -- Auto-cleanup on removal
+    table.insert(ESPEntries[model].conns, model.AncestryChanged:Connect(function(_, parent)
+        if parent == nil then
+            removeEntry(model)
+        end
+    end))
+end
+
+local function registerPlayer(player: Player)
+    if player == LocalPlayer or ESPEntries[player] then return end
+
+    local entry = {
+        key = player,
+        type = "player",
+        toggleKey = "Players",
+        player = player,
+        character = player.Character,
+        billboard = nil,
+        label = nil,
+        highlight = nil,
+        conns = {},
+    }
+    ESPEntries[player] = entry
+
+    local function attachForCharacter(character: Model)
+        entry.character = character
+
+        -- Destroy previous visuals if any
+        if entry.billboard then entry.billboard:Destroy(); entry.billboard = nil end
+        if entry.highlight then entry.highlight:Destroy(); entry.highlight = nil end
+
+        -- Create visuals when a usable part appears
+        local function tryAttach()
+            local part = safeFindBillboardPart(character)
+            if not part or player.Parent ~= Players then return end
+            local board, label = createBillboard(part)
+            local highlight = createHighlight(character)
+            entry.billboard, entry.label, entry.highlight = board, label, highlight
+        end
+
+        -- Attach immediately if possible, otherwise try when parts arrive
+        tryAttach()
+
+        -- Track head/HRP appearance to re-attach if needed
+        table.insert(entry.conns, character.ChildAdded:Connect(function(child)
+            if child:IsA("BasePart") and not entry.billboard then
+                tryAttach()
+            end
+        end))
+
+        -- Clean up when character despawns
+        table.insert(entry.conns, character.AncestryChanged:Connect(function(_, parent)
+            if parent == nil then
+                if entry.billboard then entry.billboard.Enabled = false end
+                if entry.highlight then entry.highlight.Enabled = false end
+            end
+        end))
+    end
+
+    -- Character lifecycle
+    table.insert(entry.conns, player.CharacterAdded:Connect(attachForCharacter))
+    if player.Character then attachForCharacter(player.Character) end
+
+    -- Player leaves
+    table.insert(entry.conns, player.AncestryChanged:Connect(function(_, parent)
+        if parent == nil then
+            removeEntry(player)
+        end
+    end))
+end
+
+-- Case-insensitive "contains" match for model names so clones/suffixed names still match
+local function nameMatches(instance: Instance, targetLower: string)
+    local n = instance.Name
+    return typeof(n) == "string" and string.find(string.lower(n), targetLower, 1, true) ~= nil
+end
+
+local function scanForMapObjects(root: Instance)
+    for _, instance in ipairs(root:GetDescendants()) do
+        if instance:IsA("Model") then
+            local nameLower = string.lower(instance.Name)
+            for _, objectConfig in pairs(Config.ObjectTypes) do
+                if objectConfig.TargetName and nameMatches(instance, objectConfig.TargetName) then
+                    registerMapObject(instance, objectConfig)
+                    break
+                end
+            end
+        end
+    end
+end
+
+--[[--------------------------------------------------------------------------------
+    [GUI]
+----------------------------------------------------------------------------------]]
+local function createAdvancedGUI()
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "ESP_Menu"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = PlayerGui
+
+    local panel = Instance.new("Frame")
+    panel.Name = "ESPPanel"
+    panel.Size = UDim2.fromOffset(200, 230)
+    panel.Position = UDim2.new(0.5, -100, -0.5, -115)
+    panel.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+    panel.BorderSizePixel = 0
+    panel.ClipsDescendants = true
+    panel.Parent = screenGui
+    Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 8)
+    local stroke = Instance.new("UIStroke", panel); stroke.Color = Color3.fromRGB(80, 80, 80); stroke.Thickness = 1
+
+    local header = Instance.new("Frame", panel)
+    header.Size = UDim2.new(1, 0, 0, 35)
+    header.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    header.BorderSizePixel = 0
+    Instance.new("UICorner", header).CornerRadius = UDim.new(0, 8)
+
+    local headerTitle = Instance.new("TextLabel", header)
+    headerTitle.Size = UDim2.fromScale(1, 1)
+    headerTitle.BackgroundTransparency = 1
+    headerTitle.Text = "ESP Menu"
+    headerTitle.Font = Enum.Font.SourceSansBold
+    headerTitle.TextColor3 = Color3.fromRGB(230, 230, 230)
+    headerTitle.TextSize = 18
+
+    local contentFrame = Instance.new("Frame", panel)
+    contentFrame.Position = UDim2.new(0, 0, 0, 35)
+    contentFrame.Size = UDim2.new(1, 0, 1, -35)
+    contentFrame.BackgroundTransparency = 1
+
+    local listLayout = Instance.new("UIListLayout", contentFrame)
+    listLayout.Padding = UDim.new(0, 8)
+    listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    listLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    listLayout.FillDirection = Enum.FillDirection.Vertical
+    local padding = Instance.new("UIPadding", contentFrame)
+    padding.PaddingTop = UDim.new(0, 10)
+
+    local function createToggleSwitch(text, key, order)
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, -20, 0, 35)
+        frame.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        frame.BorderSizePixel = 0
+        frame.LayoutOrder = order
+        frame.Parent = contentFrame
+        Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 6)
+
+        local label = Instance.new("TextLabel", frame)
+        label.Position = UDim2.fromOffset(10, 0)
+        label.Size = UDim2.new(0, 100, 1, 0)
+        label.BackgroundTransparency = 1
+        label.Font = Enum.Font.SourceSans
+        label.TextColor3 = Color3.fromRGB(220, 220, 220)
+        label.Text = text
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.TextSize = 16
+
+        local switchBG = Instance.new("Frame", frame)
+        switchBG.AnchorPoint = Vector2.new(1, 0.5)
+        switchBG.Position = UDim2.new(1, -10, 0.5, 0)
+        local bgSize = Vector2.new(40, 20)
+        switchBG.Size = UDim2.fromOffset(bgSize.X, bgSize.Y)
+        switchBG.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+        Instance.new("UICorner", switchBG).CornerRadius = UDim.new(1, 0)
+
+        local knobSize = Vector2.new(16, 16)
+        local knobPadding = (bgSize.Y - knobSize.Y) / 2
+        local switchKnob = Instance.new("Frame", switchBG)
+        switchKnob.AnchorPoint = Vector2.new(0, 0.5)
+        switchKnob.Size = UDim2.fromOffset(knobSize.X, knobSize.Y)
+        switchKnob.BackgroundColor3 = Color3.fromRGB(200, 200, 200)
+        Instance.new("UICorner", switchKnob).CornerRadius = UDim.new(1, 0)
+
+        local offPosition = UDim2.new(0, knobPadding, 0.5, 0)
+        local onPosition = UDim2.new(1, -knobSize.X - knobPadding, 0.5, 0)
+        switchKnob.Position = Config.Toggles[key] and onPosition or offPosition
+
+        local button = Instance.new("TextButton", frame)
+        button.Size = UDim2.fromScale(1, 1)
+        button.BackgroundTransparency = 1
+        button.Text = ""
+
+        local tweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+        local function applyState(state: boolean)
+            TweenService:Create(switchBG, tweenInfo, { BackgroundColor3 = state and Color3.fromRGB(0,150,0) or Color3.fromRGB(80,80,80) }):Play()
+            TweenService:Create(switchKnob, tweenInfo, { Position = state and onPosition or offPosition }):Play()
+        end
+
+        button.MouseButton1Click:Connect(function()
+            Config.Toggles[key] = not Config.Toggles[key]
+            applyState(Config.Toggles[key])
+        end)
+
+        -- Initialize visuals to current state
+        applyState(Config.Toggles[key])
+    end
+
+    createToggleSwitch("Players", "Players", 1)
+    createToggleSwitch("Generators", "Generators", 2)
+    createToggleSwitch("Pallets", "Pallets", 3)
+    createToggleSwitch("Hooks", "Hooks", 4)
+
+    local mainButton = Instance.new("TextButton")
+    mainButton.Name = "ESPMainBtn"
+    mainButton.Size = UDim2.fromOffset(80, 30)
+    mainButton.Position = UDim2.new(1, -90, 0.5, -15)
+    mainButton.Text = "ESP"
+    mainButton.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+    mainButton.TextColor3 = Color3.fromRGB(230, 230, 230)
+    mainButton.Font = Enum.Font.SourceSansBold
+    mainButton.Parent = screenGui
+    Instance.new("UICorner", mainButton).CornerRadius = UDim.new(0, 6)
+    local btnStroke = Instance.new("UIStroke", mainButton); btnStroke.Color = Color3.fromRGB(80, 80, 80)
+
+    local panelVisible = false
+    local openTween = TweenService:Create(panel, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Position = UDim2.new(0.5, -100, 0.5, -115)})
+    local closeTween = TweenService:Create(panel, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Position = UDim2.new(0.5, -100, -0.5, -115)})
+
+    local function togglePanel()
+        panelVisible = not panelVisible
+        if panelVisible then openTween:Play() else closeTween:Play() end
+    end
+
+    mainButton.MouseButton1Click:Connect(togglePanel)
+    UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if not gameProcessed and input.KeyCode == Config.MenuKeybind then
+            togglePanel()
+        end
+    end)
+
+    -- Draggable
+    local dragging = false
+    local dragStart, startPos
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = panel.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    header.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+end
+
+--[[--------------------------------------------------------------------------------
+    [INITIALIZATION]
+----------------------------------------------------------------------------------]]
+createAdvancedGUI()
+
+-- Players
+Players.PlayerAdded:Connect(registerPlayer)
+Players.PlayerRemoving:Connect(function(plr) removeEntry(plr) end)
+for _, player in ipairs(Players:GetPlayers()) do
+    registerPlayer(player)
+end
+
+-- Map objects: do an initial scan of the entire Workspace
+scanForMapObjects(Workspace)
+
+-- Dynamically register future models anywhere under Workspace (handles map reloads)
+Workspace.DescendantAdded:Connect(function(inst)
+    if not inst:IsA("Model") then return end
+    local nameLower = string.lower(inst.Name)
+    for _, objectConfig in pairs(Config.ObjectTypes) do
+        if objectConfig.TargetName and string.find(nameLower, objectConfig.TargetName, 1, true) then
+            registerMapObject(inst, objectConfig)
+            break
+        end
+    end
+end)
+
+-- Clean stale entries automatically when their key leaves the tree
+-- (player Parent nil or model Parent nil)
+-- Already handled via AncestryChanged in register functions and in the loop below.
+
+-- Throttled update loop (20 Hz) for stability and performance
+local accum = 0
+RunService.Heartbeat:Connect(function(dt)
+    accum += dt
+    if accum < 0.05 then return end
+    accum = 0
+
+    local cam = Camera
+    local camPos = cam and cam.CFrame and cam.CFrame.Position or nil
+
+    for key, entry in pairs(ESPEntries) do
+        -- Validate key is still alive
+        if typeof(key) == "Instance" then
+            if key.Parent == nil then
+                removeEntry(key)
+            else
+                updateVisuals(entry, camPos)
+            end
+        else
+            -- Unexpected key type; remove defensively
+            removeEntry(key)
+        end
+    end
+end)
